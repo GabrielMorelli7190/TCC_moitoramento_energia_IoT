@@ -1,0 +1,581 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <math.h>
+#include <Preferences.h>
+
+/* ========= LOG UNIFICADO ========= */
+static void addToLog(String m) {
+  unsigned long up = millis();
+  unsigned long h  = up / 3600000UL;
+  unsigned long mn = (up % 3600000UL) / 60000UL;
+  unsigned long s  = (up % 60000UL) / 1000UL;
+  Serial.printf("[%02lu:%02lu:%02lu] %s\n", h, mn, s, m.c_str());
+  extern PubSubClient client;
+  if (client.connected()) {
+    DynamicJsonDocument d(256);
+    d["log"] = m; d["timestamp"] = millis(); d["uptime"] = up; d["fonte"] = "esp32";
+    String out; serializeJson(d, out);
+    client.publish("energy/system/log", out.c_str());
+  }
+}
+
+/* ======================== WIFI / MQTT ======================== */
+const char* ssid        = "nome da rede";
+const char* password    = "senha da rede";
+const char* mqtt_server = "ip da rede";
+const int   mqtt_port   = 1883;
+const char* mqtt_user   = "";
+const char* mqtt_pass   = "";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+/* ========================== PINAGEM ========================== */
+const int MUX_A = 25, MUX_B = 26, MUX_C = 27, MUX_Z = 39;
+const int BTN_FAULT_I = 18;
+const int BTN_FAULT_V = 19;
+const int LED_STATUS = 2;
+const int relay_pins[] = {4, 22, 16, 17, 21};
+
+/* ======= CONFIGURAÇÕES ======= */
+#define USE_BUTTONS 0            // 0 = desliga botões; 1 = usar botões (PULLUP, ao GND)
+#define ALLOW_REMOTE_SIM 0       // bloqueia simulação por MQTT
+const bool RELAY_ACTIVE_LOW = true;
+const bool RELAY_CONTACT_NC = true;
+
+/* ===================== ADC de corrente ====================== */
+const int PIN_I_SALA=32, PIN_I_QUARTO=33, PIN_I_COZINHA=36, PIN_I_BANH=34, PIN_I_AREA=35;
+
+/* =================== ESTRUTURA DOS CÔMODOS =================== */
+struct Room {
+  String name; int pin_current; uint8_t ch_voltage; int relay_pin;
+  bool is20A; bool relay_on;
+};
+Room rooms[] = {
+  {"sala",         PIN_I_SALA,    0, relay_pins[0], false, false},
+  {"quarto",       PIN_I_QUARTO,  1, relay_pins[1], false, false},
+  {"cozinha",      PIN_I_COZINHA, 2, relay_pins[2], true,  false},
+  {"banheiro",     PIN_I_BANH,    3, relay_pins[3], false, false},
+  {"area_servico", PIN_I_AREA,    4, relay_pins[4], false, false}
+};
+const int NUM_ROOMS = sizeof(rooms)/sizeof(rooms[0]);
+
+/* =================== MEDIÇÃO / LIMITES =================== */
+const float ADC_VREF=3.3f; const int ADC_COUNTS=4095;
+const float SENS_5A=0.185f, SENS_20A=0.100f;
+float I_GAIN_SALA=0.06f, I_GAIN_QUARTO=0.07f, I_GAIN_COZINHA=1.00f, I_GAIN_BANH=1.00f, I_GAIN_AREA=0.08f;
+float VOLTAGE_GAIN_CH[8] = {360,360,360,360,360,360,360,360};   // 127V base
+const float MIN_VOLTAGE=100.0f, MAX_VOLTAGE=260.0f;
+const float MAX_CURRENT[5]={10.0,7.0,15.0,8.0,10.0};
+const float I_FLOOR = 0.5f;
+const float HARD_MAX_V = 300.0f;   // clamp de exibição
+
+// Histerese/Carência
+const unsigned long FAULT_GRACE_MS = 3000; // 3s após mudar estado/simulação
+static unsigned long last_sim_or_load_change = 0;
+const int BAD_COUNT_TRIP  = 3;
+const int GOOD_COUNT_CLEAR = 2;
+static int bad_count[5] = {0,0,0,0,0};
+
+unsigned long last_send=0; const unsigned long SEND_INTERVAL=5000;
+bool sim_fault_I=false, sim_fault_V=false;
+
+/* =================== MÉDIA MÓVEL =================== */
+const int MOV_AVG_WINDOW=3;
+float vBuf[5][MOV_AVG_WINDOW]={0}, iBuf[5][MOV_AVG_WINDOW]={0};
+int vIdx[5]={0}, iIdx[5]={0}, vCnt[5]={0}, iCnt[5]={0}; float vSum[5]={0}, iSum[5]={0};
+float movAvg(float x,float *b,int w,int &idx,int &cnt,float &sum){
+  if(cnt<w){ sum+=x; b[idx++]=x; if(idx>=w) idx=0; cnt++; return sum/cnt; }
+  sum-=b[idx]; b[idx]=x; sum+=x; idx++; if(idx>=w) idx=0; return sum/w;
+}
+
+/* =================== NVS =================== */
+Preferences prefs;
+const char* NVS_NS="energy_cal"; const char* NVS_KEY_VER="ver";
+const uint32_t NVS_LAYOUT=2;  // bump para invalidar ganhos antigos
+const float VOLTAGE_GAIN_CH_DEFAULT[8]={360,360,360,360,360,360,360,360};
+void gainsLoadFromNVS(){ 
+  if(!prefs.begin(NVS_NS,true))return; 
+  uint32_t v=prefs.getUInt(NVS_KEY_VER,0);
+  if(v!=NVS_LAYOUT){ 
+    for(int i=0;i<8;i++) VOLTAGE_GAIN_CH[i]=VOLTAGE_GAIN_CH_DEFAULT[i]; 
+    prefs.end(); 
+    return; 
+  }
+  for(int i=0;i<8;i++){ 
+    char k[6]; snprintf(k,sizeof(k),"g%d",i); 
+    float g=prefs.getFloat(k,NAN); 
+    if(!isnan(g)&&g>0)VOLTAGE_GAIN_CH[i]=g; 
+  }
+  prefs.end();
+}
+bool gainsSaveToNVS(){ 
+  if(!prefs.begin(NVS_NS,false)) return false; 
+  prefs.putUInt(NVS_KEY_VER,NVS_LAYOUT);
+  for(int i=0;i<8;i++){ char k[6]; snprintf(k,sizeof(k),"g%d",i); prefs.putFloat(k,VOLTAGE_GAIN_CH[i]); }
+  prefs.end(); 
+  return true;
+}
+void gainsResetFactory(){ for(int i=0;i<8;i++) VOLTAGE_GAIN_CH[i]=VOLTAGE_GAIN_CH_DEFAULT[i]; }
+
+/* =================== PROTÓTIPOS =================== */
+void setupWiFi(); void setupMQTT(); void reconnectMQTT(); void mqttCallback(char*,byte*,unsigned int);
+void selectMux(uint8_t ch);
+float adcToV(int raw); float readVrmsOnce(int pin,int N,int settle_us=0); float med5(float,float,float,float,float);
+float readVoltageRMS_raw(uint8_t ch); float readCurrentRMS_stable(int pin,float sens,float igain);
+void sendRoomData(int idx); void sendSystemStatus(); void handleButtons(); bool withinSafeLimits(int idx,float V,float I);
+void clearSimFaults(); void handleSerialCommands();
+
+/* =================== LED / FEEDBACK =================== */
+bool fault_led_on=false;
+inline void setFaultLed(bool on){ fault_led_on=on; digitalWrite(LED_STATUS,on?HIGH:LOW); }
+inline void writeRelayPin(int pin,bool bobina_on){
+  digitalWrite(pin, (RELAY_ACTIVE_LOW ? (bobina_on?LOW:HIGH) : (bobina_on?HIGH:LOW)));
+}
+inline bool cargaFromBobina(bool bobina){ return RELAY_CONTACT_NC ? !bobina : bobina; }
+
+inline void setLoadState(int idx, bool load_on){
+  if(idx<0 || idx>=NUM_ROOMS) return;
+  bool bobina = RELAY_CONTACT_NC ? !load_on : load_on;
+  rooms[idx].relay_on = bobina;
+  writeRelayPin(rooms[idx].relay_pin, bobina);
+
+  DynamicJsonDocument d(200);
+  d["comodo"]=rooms[idx].name; d["relay_estado"]=load_on; d["timestamp"]=millis();
+  String out; serializeJson(d,out);
+  client.publish(("energy/relay/status/"+rooms[idx].name).c_str(), out.c_str(), true);
+
+  last_sim_or_load_change = millis(); // inicia carência
+  addToLog(String("Carga ")+rooms[idx].name+(load_on?" LIGADA":" DESLIGADA"));
+}
+
+inline void setAllLoads(bool load_on){ 
+  for(int i=0;i<NUM_ROOMS;i++){ setLoadState(i, load_on); delay(120);} 
+}
+
+/* ============================ SETUP ============================ */
+void setup(){
+  Serial.begin(115200); delay(700);
+  Serial.println("\n=== Sistema de Monitoramento de Energia v3.7 ===");
+  
+  pinMode(MUX_A,OUTPUT); pinMode(MUX_B,OUTPUT); pinMode(MUX_C,OUTPUT); pinMode(MUX_Z,INPUT);
+
+#if USE_BUTTONS
+  pinMode(BTN_FAULT_I,INPUT_PULLUP);
+  pinMode(BTN_FAULT_V,INPUT_PULLUP);
+  Serial.println("[SETUP] Botões PULLUP (pressiona=LOW)");
+#else
+  pinMode(BTN_FAULT_I,INPUT);   // ignorados
+  pinMode(BTN_FAULT_V,INPUT);
+  Serial.println("[SETUP] Botões DESATIVADOS (simulação por software)");
+#endif
+
+  pinMode(LED_STATUS,OUTPUT); setFaultLed(false);
+
+  pinMode(PIN_I_SALA,INPUT); pinMode(PIN_I_QUARTO,INPUT); pinMode(PIN_I_COZINHA,INPUT);
+  pinMode(PIN_I_BANH,INPUT); pinMode(PIN_I_AREA,INPUT);
+
+  analogSetWidth(12);
+  analogSetPinAttenuation(MUX_Z,ADC_11db);
+  analogSetPinAttenuation(PIN_I_SALA,ADC_11db);
+  analogSetPinAttenuation(PIN_I_QUARTO,ADC_11db);
+  analogSetPinAttenuation(PIN_I_COZINHA,ADC_11db);
+  analogSetPinAttenuation(PIN_I_BANH,ADC_11db);
+  analogSetPinAttenuation(PIN_I_AREA,ADC_11db);
+  Serial.println("[SETUP] ADCs ok (12b, 11db)");
+
+  // Inicia com CARGA LIGADA (NC => bobina OFF)
+  for(int i=0;i<NUM_ROOMS;i++){ 
+    pinMode(rooms[i].relay_pin,OUTPUT); 
+    rooms[i].relay_on = !RELAY_CONTACT_NC; 
+    writeRelayPin(rooms[i].relay_pin, rooms[i].relay_on); 
+  }
+  Serial.println("[SETUP] Relés inicializados - cargas LIGADAS");
+
+  setupWiFi(); setupMQTT(); gainsLoadFromNVS();
+
+  for(int i=0;i<NUM_ROOMS;i++){
+    bool load_on=cargaFromBobina(rooms[i].relay_on);
+    DynamicJsonDocument s(128);
+    s["comodo"]=rooms[i].name; s["relay_estado"]=load_on; s["timestamp"]=millis();
+    String msg; serializeJson(s,msg);
+    client.publish(("energy/relay/status/"+rooms[i].name).c_str(), msg.c_str(), true);
+  }
+
+  last_sim_or_load_change = millis(); // carência inicial
+  Serial.println("[SETUP] Sistema pronto!\n");
+}
+
+/* ======================= WIFI / MQTT ======================== */
+void setupWiFi(){ 
+  Serial.print("[WiFi] Conectando...");
+  WiFi.mode(WIFI_STA); WiFi.begin(ssid,password); 
+  for(int i=0;i<40 && WiFi.status()!=WL_CONNECTED;i++){ delay(250); Serial.print("."); }
+  if(WiFi.status()==WL_CONNECTED) Serial.printf("\n[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
+  else Serial.println("\n[WiFi] FALHA");
+}
+
+void setupMQTT(){ 
+  client.setServer(mqtt_server,mqtt_port); 
+  client.setCallback(mqttCallback); 
+  client.setKeepAlive(60); 
+  client.setSocketTimeout(30); 
+  reconnectMQTT(); 
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length){
+  String msg; for(unsigned int i=0;i<length;i++) msg+=(char)payload[i];
+  String t=String(topic);
+
+  // -------- CONTROLE GERAL (TODOS) --------
+  if(t=="energy/control/relay"){
+    if(msg=="ON")  setAllLoads(true);
+    else if(msg=="OFF") setAllLoads(false);
+    return;
+  }
+
+  // -------- EMERGÊNCIA --------
+  if(t=="energy/control/emergency" && msg=="SHUTDOWN"){
+    setAllLoads(false); setFaultLed(true);
+    DynamicJsonDocument d(200); d["alerta"]="desligamento_emergencia"; d["timestamp"]=millis();
+    String out; serializeJson(d,out); client.publish("energy/alert/emergency", out.c_str());
+    addToLog("EMERGÊNCIA: todas as cargas DESLIGADAS");
+    return;
+  }
+
+  // -------- LIMPAR SIMULAÇÕES --------
+  if(t=="energy/control/clear_faults"){
+    clearSimFaults();
+    setAllLoads(true);
+    return;
+  }
+
+  // -------- MANUTENÇÃO --------
+  if(t=="energy/control/reset" && msg=="RESET"){ addToLog("Reiniciando por MQTT..."); delay(500); ESP.restart(); return; }
+  if(t=="energy/control/save_gains"){ gainsSaveToNVS(); addToLog("Ganhos salvos"); return; }
+  if(t=="energy/control/reset_gains"){ gainsResetFactory(); addToLog("Ganhos resetados (default)"); return; }
+
+  // -------- CALIBRAÇÃO / GANHO DE TENSÃO --------
+  if(t=="energy/control/set_gain"){
+    DynamicJsonDocument d(256);
+    if(deserializeJson(d,msg)==DeserializationError::Ok){
+      int ch=d["ch"]|-1; float g=d["gain"]|0.0f;
+      if(ch>=0&&ch<8&&g>0) VOLTAGE_GAIN_CH[ch]=g;
+    }
+    return;
+  }
+  if(t=="energy/control/calibrate"){
+    DynamicJsonDocument d(256);
+    if(deserializeJson(d,msg)==DeserializationError::Ok){
+      int ch=d["ch"]|-1; float vrede=d["vrede"]|127.0f;
+      if(ch>=0&&ch<8&&vrede>10.0f){
+        float r=med5(readVoltageRMS_raw((uint8_t)ch),readVoltageRMS_raw((uint8_t)ch),
+                     readVoltageRMS_raw((uint8_t)ch),readVoltageRMS_raw((uint8_t)ch),
+                     readVoltageRMS_raw((uint8_t)ch));
+        if(r>0.0005f){ VOLTAGE_GAIN_CH[ch]=vrede/r; addToLog(String("Calib ch ")+ch+" -> "+String(VOLTAGE_GAIN_CH[ch],2)); }
+      }
+    }
+    return;
+  }
+
+  // -------- BLOQUEIO DE SIMULAÇÃO REMOTA (se configurado) --------
+  if(!ALLOW_REMOTE_SIM && (t=="energy/control/sim_I" || t=="energy/control/sim_V" || t=="energy/control/sim/set")) {
+    addToLog("Simulação remota ignorada (ALLOW_REMOTE_SIM=0)");
+    return;
+  }
+
+  // -------- CONTROLE POR CÔMODO (EX.: energy/control/sala) --------
+  if (t.startsWith("energy/control/") && t != "energy/control/relay") {
+    // extrai o nome do cômodo após "energy/control/"
+    String room = t.substring(15);  // 15 = len("energy/control/")
+    // payload simples: "ON" ou "OFF"
+    bool hasAction = (msg=="ON" || msg=="OFF");
+    if (hasAction) {
+      for (int i=0; i<NUM_ROOMS; i++) {
+        if (rooms[i].name == room) {
+          setLoadState(i, (msg=="ON"));   // ON = ligar CARGA ; OFF = desligar CARGA
+          return;
+        }
+      }
+      addToLog(String("Controle por cômodo: não encontrei '") + room + "'");
+    }
+    return;
+  }
+}
+
+void reconnectMQTT(){
+  for(int a=0; a<6 && !client.connected(); a++){
+    Serial.print("[MQTT] Conectando...");
+    String id="ESP32_Energy_"+String(random(0xffff),HEX);
+    bool ok=(strlen(mqtt_user)>0)
+      ? client.connect(id.c_str(), mqtt_user, mqtt_pass, "energy/system/status", 0, true, "{\"sistema\":\"offline\"}")
+      : client.connect(id.c_str(), "energy/system/status", 0, true, "{\"sistema\":\"offline\"}");
+    if(ok){ client.subscribe("energy/control/#"); addToLog("MQTT conectado"); Serial.println(" OK!"); break; }
+    Serial.println(" FALHA!"); delay(1500);
+  }
+}
+
+/* ==================== LEITURA ANALÓGICA ==================== */
+void selectMux(uint8_t ch){ 
+  digitalWrite(MUX_A,(ch&1)?HIGH:LOW); 
+  digitalWrite(MUX_B,(ch&2)?HIGH:LOW); 
+  digitalWrite(MUX_C,(ch&4)?HIGH:LOW); 
+}
+float adcToV(int raw){ return (raw*ADC_VREF)/ADC_COUNTS; }
+float readVrmsOnce(int pin,int N,int settle_us){ 
+  if(settle_us>0) delayMicroseconds(settle_us);
+  long off=0; for(int i=0;i<50;i++){ off+=analogRead(pin); delayMicroseconds(50); }
+  float offV=adcToV(off/50); double acc=0.0;
+  for(int i=0;i<N;i++){ float v=adcToV(analogRead(pin)); float dv=v-offV; acc+=dv*dv; delayMicroseconds(200); }
+  return sqrt(acc/N);
+}
+float med5(float a,float b,float c,float d,float e){ float v[5]={a,b,c,d,e}; for(int i=1;i<5;i++){float t=v[i];int j=i-1;while(j>=0&&v[j]>t){v[j+1]=v[j];j--;}v[j+1]=t;} return v[2]; }
+float readVoltageRMS_raw(uint8_t ch){
+  selectMux(ch); for(int i=0;i<10;i++){ analogRead(MUX_Z); delayMicroseconds(200); }
+  return med5(readVrmsOnce(MUX_Z,128,200),readVrmsOnce(MUX_Z,128,200),
+              readVrmsOnce(MUX_Z,128,200),readVrmsOnce(MUX_Z,128,200),
+              readVrmsOnce(MUX_Z,128,200));
+}
+float readCurrentRMS_stable(int pin,float sens,float igain){
+  float r=med5(readVrmsOnce(pin,128,0),readVrmsOnce(pin,128,0),
+               readVrmsOnce(pin,128,0),readVrmsOnce(pin,128,0),
+               readVrmsOnce(pin,128,0));
+  float A=(r/sens)*igain; if(A<I_FLOOR) A=0.0f; return A;
+}
+
+/* =================== LÓGICA DO SISTEMA =================== */
+bool withinSafeLimits(int idx,float V,float I){
+  if (V>50.0f && (V<MIN_VOLTAGE || V>MAX_VOLTAGE)) return false;
+  if (I>MAX_CURRENT[idx]) return false;
+  return true;
+}
+
+void sendRoomData(int idx){
+  Room &r=rooms[idx];
+
+  float vr=readVoltageRMS_raw(r.ch_voltage);
+  float Vcalc=vr*VOLTAGE_GAIN_CH[r.ch_voltage];
+  float V=movAvg(Vcalc,vBuf[idx],MOV_AVG_WINDOW,vIdx[idx],vCnt[idx],vSum[idx]);
+
+  float sens=r.is20A?SENS_20A:SENS_5A;
+  float igain=(r.name=="sala")?I_GAIN_SALA:(r.name=="quarto")?I_GAIN_QUARTO:
+              (r.name=="cozinha")?I_GAIN_COZINHA:(r.name=="banheiro")?I_GAIN_BANH:I_GAIN_AREA;
+  float Iraw=readCurrentRMS_stable(r.pin_current,sens,igain);
+  float I=movAvg(Iraw,iBuf[idx],MOV_AVG_WINDOW,iIdx[idx],iCnt[idx],iSum[idx]);
+
+  // efetivos (simulação)
+  float V_eff = sim_fault_V ? (MIN_VOLTAGE - 10.0f) : V;
+  float I_eff = sim_fault_I ? (MAX_CURRENT[idx] + 1.0f) : I;
+
+  bool carga_on=cargaFromBobina(rooms[idx].relay_on);
+
+  // Histerese + carência
+  unsigned long now = millis();
+  bool can_evaluate = (now - last_sim_or_load_change) > FAULT_GRACE_MS;
+  bool out_of_limits = !withinSafeLimits(idx, V_eff, I_eff);
+
+  if (can_evaluate) {
+    if (out_of_limits) {
+      bad_count[idx]++;
+    } else if (bad_count[idx] > 0) {
+      bad_count[idx] = max(0, bad_count[idx] - GOOD_COUNT_CLEAR);
+    }
+
+    if (carga_on && bad_count[idx] >= BAD_COUNT_TRIP) {
+      setLoadState(idx, false);
+      bad_count[idx] = 0;
+      DynamicJsonDocument alert(256);
+      alert["alerta"]="desligamento_automatico";
+      alert["comodo"]=r.name; alert["tensao"]=V; alert["corrente"]=I;
+      alert["timestamp"]=millis(); alert["motivo"]="fora_dos_limites";
+      String out; serializeJson(alert, out);
+      client.publish("energy/alert/auto_shutdown", out.c_str());
+      setFaultLed(true);
+      carga_on = false;
+    }
+  } else {
+    bad_count[idx] = 0; // não acumula no grace
+  }
+
+  // Exibição (clamp)
+  float V_show = V;
+  if (V_show < 0 || V_show > HARD_MAX_V) V_show = 0.0f;
+  if (sim_fault_V) V_show = V_eff;
+
+  DynamicJsonDocument d(400);
+  d["comodo"]=r.name;
+  d["tensao"]=round(V_show*100.0)/100.0;
+  d["corrente"]=round(I*1000.0)/1000.0;
+  d["timestamp"]=millis();
+  d["relay_estado"]=carga_on;
+  d["canal_tensao"]=r.ch_voltage;
+  d["pino_corrente"]=r.pin_current;
+  d["falha_corrente"]=sim_fault_I;
+  d["falha_tensao"]=sim_fault_V;
+  d["sensor_tipo"]= r.is20A ? "ACS712_20A" : "ACS712_5A";
+  String out; serializeJson(d,out);
+  client.publish(("energy/room/"+r.name).c_str(), out.c_str());
+
+  Serial.printf("[%s] ch=%d V_adc=%.6f V=%.2f | pin=%d I=%.3fA | %s (bc=%d, grace=%s)\n",
+    r.name.c_str(), r.ch_voltage, vr, V, r.pin_current, I, carga_on?"ON":"OFF",
+    bad_count[idx], can_evaluate?"no":"YES");
+}
+
+void sendSystemStatus(){ 
+  DynamicJsonDocument d(600);
+  d["sistema"]="online"; d["wifi_rssi"]=WiFi.RSSI(); d["wifi_ip"]=WiFi.localIP().toString();
+  d["uptime"]=millis(); d["versao"]="3.7-hyst-grace";
+  d["sim_fault_I"]=sim_fault_I; d["sim_fault_V"]=sim_fault_V;
+  JsonArray reles=d.createNestedArray("reles"); 
+  for(int i=0;i<NUM_ROOMS;i++){ 
+    JsonObject o=reles.createNestedObject(); bool carga_on=cargaFromBobina(rooms[i].relay_on);
+    o["comodo"]=rooms[i].name; o["estado"]=carga_on; o["pino"]=rooms[i].relay_pin; 
+    o["canal_tensao"]=rooms[i].ch_voltage; o["pino_corrente"]=rooms[i].pin_current; 
+    o["sensor"]=rooms[i].is20A?"20A":"5A"; 
+  }
+  String out; serializeJson(d,out); client.publish("energy/system/status", out.c_str());
+}
+
+/* =================== BOTÕES (opcional) =================== */
+void handleButtons(){
+#if USE_BUTTONS
+  static bool inited=false;
+  static int stableI=HIGH, stableV=HIGH;
+  static int lastRawI=HIGH, lastRawV=HIGH;
+  static unsigned long tChangeI=0, tChangeV=0;
+  const unsigned long DEB=60;
+
+  if(!inited){ 
+    stableI=digitalRead(BTN_FAULT_I); stableV=digitalRead(BTN_FAULT_V); 
+    lastRawI=stableI; lastRawV=stableV; tChangeI=tChangeV=millis(); inited=true; 
+  }
+
+  int rawI = digitalRead(BTN_FAULT_I);
+  int rawV = digitalRead(BTN_FAULT_V);
+  unsigned long now = millis();
+  if (rawI != lastRawI) { lastRawI = rawI; tChangeI = now; }
+  if (rawV != lastRawV) { lastRawV = rawV; tChangeV = now; }
+  if ((now - tChangeI) >= DEB) stableI = rawI;
+  if ((now - tChangeV) >= DEB) stableV = rawV;
+
+  bool pressedI = (stableI == LOW);
+  bool pressedV = (stableV == LOW);
+
+  // Pressionar ativa, soltar desativa
+  if (pressedI != sim_fault_I) {
+    sim_fault_I = pressedI;
+    last_sim_or_load_change = millis();
+    if (sim_fault_I) { setAllLoads(false); setFaultLed(true); addToLog("Simulação CORRENTE ON"); }
+    else { setAllLoads(true); setFaultLed(sim_fault_V); addToLog("Simulação CORRENTE OFF"); }
+  }
+  if (pressedV != sim_fault_V) {
+    sim_fault_V = pressedV;
+    last_sim_or_load_change = millis();
+    if (sim_fault_V) { setAllLoads(false); setFaultLed(true); addToLog("Simulação TENSÃO ON"); }
+    else { setAllLoads(true); setFaultLed(sim_fault_I); addToLog("Simulação TENSÃO OFF"); }
+  }
+#endif
+}
+
+/* =================== CLEAR SIMS =================== */
+void clearSimFaults() {
+  sim_fault_I = false; sim_fault_V = false;
+  setFaultLed(false);
+  last_sim_or_load_change = millis();
+  addToLog("Simulações limpas (tensão e corrente)");
+  DynamicJsonDocument d(128);
+  d["simulacao_falha_corrente"]=false; d["simulacao_falha_tensao"]=false; d["timestamp"]=millis();
+  String out; serializeJson(d,out); client.publish("energy/system/sim_fault", out.c_str());
+}
+
+/* ============================ LOOP ============================ */
+void loop(){
+  if(WiFi.status()!=WL_CONNECTED) setupWiFi();
+  if(!client.connected()) reconnectMQTT();
+  client.loop();
+
+  handleButtons();
+  handleSerialCommands();
+
+  unsigned long now=millis();
+  if(now-last_send>=SEND_INTERVAL){
+    last_send=now;
+    Serial.println("\n=== Ciclo de Medição ===");
+    for(int i=0;i<NUM_ROOMS;i++){ Serial.printf("Medindo %s...\n", rooms[i].name.c_str()); sendRoomData(i); delay(160); }
+    sendSystemStatus();
+    Serial.println("=== Fim do Ciclo ===\n");
+  }
+  delay(60);
+}
+
+/* =================== SERIAL: CAL / DIAGNÓSTICOS / SIM =================== */
+// Comandos:
+//  cal <ch> <Vref> | setgain <ch> <valor> | gains | save | reset | clear
+//  idiag | scanv | mapv | simi on/off | simv on/off
+void handleSerialCommands(){
+  if(!Serial.available()) return;
+  String line=Serial.readStringUntil('\n'); line.trim(); if(!line.length()) return;
+
+  if(line.startsWith("cal")){
+    int ch; float vrede;
+    int ok = sscanf(line.c_str(),"cal %d %f",&ch,&vrede);
+    if(ok==2 && ch>=0 && ch<8 && vrede>10.0f){
+      float r = med5(readVoltageRMS_raw((uint8_t)ch),readVoltageRMS_raw((uint8_t)ch),
+                     readVoltageRMS_raw((uint8_t)ch),readVoltageRMS_raw((uint8_t)ch),
+                     readVoltageRMS_raw((uint8_t)ch));
+      if(r>0.0005f){
+        float newGain = vrede / r;
+        VOLTAGE_GAIN_CH[ch]=newGain;
+        Serial.printf("[CALIB] ch=%d  vrms_adc=%.6f V  Vref=%.2f V  gain=%.2f\n", ch, r, vrede, newGain);
+      } else Serial.println("[CALIB] Vrms muito baixo — verifique ZMPT/4051");
+    } else Serial.println("Uso: cal <canal 0..7> <tensao_ref>");
+  }
+  else if(line.startsWith("setgain")){
+    int ch; float g; if(sscanf(line.c_str(),"setgain %d %f",&ch,&g)==2 && ch>=0&&ch<8&&g>0.0f){
+      VOLTAGE_GAIN_CH[ch]=g; Serial.printf("[SETGAIN] ch=%d gain=%.2f\n",ch,g);
+    } else Serial.println("Uso: setgain <canal 0..7> <valor>");
+  }
+  else if(line=="gains"){ Serial.print("Ganhos: "); for(int i=0;i<8;i++) Serial.printf("%s%.2f",i?", ":"",VOLTAGE_GAIN_CH[i]); Serial.println(); }
+  else if(line=="save"){ if(gainsSaveToNVS()) Serial.println("NVS: ganhos salvos"); }
+  else if(line=="reset"){ gainsResetFactory(); Serial.println("Ganhos resetados para DEFAULT (grave com save)"); }
+  else if(line=="clear"){ clearSimFaults(); Serial.println("Simulações limpas."); }
+
+  else if(line=="idiag") {
+    struct { const char* nome; int pin; bool is20; float &ig; } T[] = {
+      {"sala", PIN_I_SALA, false, I_GAIN_SALA},
+      {"quarto", PIN_I_QUARTO, false, I_GAIN_QUARTO},
+      {"area_servico", PIN_I_AREA, false, I_GAIN_AREA},
+    };
+    for (auto &x : T) {
+      float r = med5(readVrmsOnce(x.pin, 128, 0),readVrmsOnce(x.pin, 128, 0),
+                     readVrmsOnce(x.pin, 128, 0),readVrmsOnce(x.pin, 128, 0),
+                     readVrmsOnce(x.pin, 128, 0));
+      float sens = x.is20 ? SENS_20A : SENS_5A;
+      float A = (r / sens) * x.ig; if (A < I_FLOOR) A = 0.0f;
+      Serial.printf("[IDIAG %s] Vrms_ADC=%.6f V  I_calc=%.3f A (igain=%.3f)\n", x.nome, r, A, x.ig);
+    }
+  }
+  else if (line=="scanv") {
+    for (int ch=0; ch<8; ch++) {
+      float vr = readVoltageRMS_raw((uint8_t)ch);
+      float V  = vr * VOLTAGE_GAIN_CH[ch];
+      Serial.printf("[SCANV ch=%d] Vrms_ADC=%.6f V  V_est=%.2f V (gain=%.2f)\n", ch, vr, V, VOLTAGE_GAIN_CH[ch]);
+    }
+  }
+  else if (line=="mapv") {
+    for (int i=0; i<NUM_ROOMS; i++) {
+      int ch = rooms[i].ch_voltage;
+      float vr = readVoltageRMS_raw((uint8_t)ch);
+      float V  = vr * VOLTAGE_GAIN_CH[ch];
+      Serial.printf("[MAPV %-13s] ch=%d  Vrms_ADC=%.6f V  V_est=%.2f V (gain=%.2f)\n",
+                    rooms[i].name.c_str(), ch, vr, V, VOLTAGE_GAIN_CH[ch]);
+    }
+  }
+  else if (line=="simi on")  { sim_fault_I=true;  last_sim_or_load_change=millis(); setAllLoads(false); setFaultLed(true);  Serial.println("Sim I ON"); }
+  else if (line=="simi off") { sim_fault_I=false; last_sim_or_load_change=millis(); setAllLoads(true);  setFaultLed(sim_fault_V); Serial.println("Sim I OFF"); }
+  else if (line=="simv on")  { sim_fault_V=true;  last_sim_or_load_change=millis(); setAllLoads(false); setFaultLed(true);  Serial.println("Sim V ON"); }
+  else if (line=="simv off") { sim_fault_V=false; last_sim_or_load_change=millis(); setAllLoads(true);  setFaultLed(sim_fault_I); Serial.println("Sim V OFF"); }
+
+  else { Serial.println("Comandos: cal | setgain | gains | save | reset | clear | idiag | scanv | mapv | simi on/off | simv on/off"); }
+}

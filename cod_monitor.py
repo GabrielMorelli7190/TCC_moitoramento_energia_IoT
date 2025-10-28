@@ -23,7 +23,7 @@ class SimplifiedEnergyMonitor:
 
     def __init__(self):
         # Configurações MQTT
-        self.mqtt_broker = "192.168.1.153"
+        self.mqtt_broker = "seu ip da rede"
         self.mqtt_port = 1883
         self.mqtt_user = ""            # deixe vazio se não usa auth
         self.mqtt_password = ""

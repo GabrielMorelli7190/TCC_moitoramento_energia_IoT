@@ -38,7 +38,7 @@ Durante os testes, o sistema apresentou:
 - Resposta rápida no desligamento de cargas em condições críticas.  
 
 ## 🔮 Trabalhos Futuros
-- Implementação de **armazenamento em nuvem** para histórico de consumo.  
+- Implementação de **armazenamento** para histórico de consumo.  
 - Cálculo de **potência ativa e reativa**, além da potência aparente.  
 - Versão móvel da interface para **monitoramento via celular**.  
 

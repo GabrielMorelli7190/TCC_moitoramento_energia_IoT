@@ -18,8 +18,11 @@ Este projeto apresenta o desenvolvimento de um **sistema de monitoramento e cont
 - Registro de logs e alertas automáticos.  
 
 ## 🖥️ Estrutura do Projeto
+
 ├── cod_arduino_esp_monitor # Código do ESP32 (Arduino)
+
 ├── cod_monitor.py # Interface e processamento em Python
+
 └── README.md # Descrição do projeto
 
 ## 🚀 Como Executar

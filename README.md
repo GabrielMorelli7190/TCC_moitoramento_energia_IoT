@@ -7,10 +7,11 @@ Este projeto apresenta o desenvolvimento de um **sistema de monitoramento e cont
 - **Sensor ACS712 (5A / 20A)** – Medição de corrente elétrica.  
 - **Sensor ZMPT101B** – Medição de tensão alternada da rede.  
 - **Módulo Relé 5V (ativo em LOW)** – Controle de cargas conectadas.  
-- **LED e Buzzer** – Indicação de falhas e alertas.  
+- **LED** – Indicação de falhas e alertas.  
 - **Aplicação Python (cod_monitor.py)** – Processamento dos dados, exibição em interface gráfica e comunicação com o ESP32.
 
-## 🧠 Funcionalidades Principais
+## 🧠 Funcionalidades Principais![MuaKissGIF](https://github.com/user-attachments/assets/ae2ceab0-4bf7-4c79-8ce1-97f99e39a641)
+
 - Monitoramento em tempo real de **tensão, corrente e potência**.  
 - **Desligamento automático** de cargas em casos de subtensão ou sobrecorrente.  
 - Exibição gráfica de dados através da aplicação Python.  
@@ -45,8 +46,7 @@ Durante os testes, o sistema apresentou:
 ## 👨‍🔧 Autor
 **Gabriel Henrique Morelli**  
 Curso: Engenharia de Controle e Automação  
-Instituição: FENTESC – Faculdade de Engenharia e Tecnologia  
-
+Instituição: PUCCAMP - Pontifícia Universidade Católica de Campinas
 ---
 
 🧾 *Este repositório faz parte do Trabalho de Conclusão de Curso intitulado “Solução IoT para Monitoramento de Eficiência Energética”.*

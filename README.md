@@ -10,7 +10,7 @@ Este projeto apresenta o desenvolvimento de um **sistema de monitoramento e cont
 - **LED** – Indicação de falhas e alertas.  
 - **Aplicação Python (cod_monitor.py)** – Processamento dos dados, exibição em interface gráfica e comunicação com o ESP32.
 
-## 🧠 Funcionalidades Principais![MuaKissGIF](https://github.com/user-attachments/assets/ae2ceab0-4bf7-4c79-8ce1-97f99e39a641)
+## 🧠 Funcionalidades Principais!
 
 - Monitoramento em tempo real de **tensão, corrente e potência**.  
 - **Desligamento automático** de cargas em casos de subtensão ou sobrecorrente.  
